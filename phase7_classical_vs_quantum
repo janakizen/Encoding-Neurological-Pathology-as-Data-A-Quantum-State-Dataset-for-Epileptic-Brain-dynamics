@@ -1,0 +1,668 @@
+import os
+import json
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    roc_curve,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+
+from qiskit.circuit.library import ZZFeatureMap
+from qiskit_machine_learning.kernels import FidelityQuantumKernel
+from qiskit_machine_learning.algorithms import QSVC
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIG
+# ============================================================
+PROJECT_DIR = "/Users/janakinagesh/Downloads/phase1_epilepsy"
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "outputs")
+COMPARE_DIR = os.path.join(OUTPUT_DIR, "classical_vs_quantum_fair")
+os.makedirs(COMPARE_DIR, exist_ok=True)
+
+X_PATH = os.path.join(OUTPUT_DIR, "quantum_dataset_X.npy")
+Y_PATH = os.path.join(OUTPUT_DIR, "quantum_dataset_y.npy")
+
+TEST_SIZE = 0.20
+RANDOM_STATE = 42
+N_SPLITS = 5
+
+# Limit runtime if needed
+MAX_TOTAL_SAMPLES = None   # e.g. 400 or None
+
+# Quantum settings
+QUBIT_DIM = 2
+ZZ_REPS = 2
+
+# Oversampling target on training folds
+BALANCE_TRAINING = True
+
+# ============================================================
+# FEATURE HELPERS
+# ============================================================
+def density_matrix_from_sequence(seq: np.ndarray) -> np.ndarray:
+    seq = np.asarray(seq, dtype=float)
+    seq = seq - np.mean(seq, axis=0, keepdims=True)
+
+    rho = np.cov(seq, rowvar=False)
+
+    if np.ndim(rho) == 0:
+        rho = np.array([[float(rho)]], dtype=float)
+
+    rho = 0.5 * (rho + rho.T)
+    tr = np.trace(rho)
+
+    if np.isclose(tr, 0):
+        d = rho.shape[0]
+        rho = np.eye(d) / d
+    else:
+        rho = rho / tr
+
+    return rho
+
+
+def von_neumann_entropy(rho: np.ndarray, eps: float = 1e-12) -> float:
+    eigvals = np.linalg.eigvalsh(rho)
+    eigvals = np.clip(eigvals, eps, 1.0)
+    eigvals = eigvals / np.sum(eigvals)
+    return float(-np.sum(eigvals * np.log2(eigvals)))
+
+
+def purity(rho: np.ndarray) -> float:
+    return float(np.trace(rho @ rho).real)
+
+
+def transport_metrics_from_sequence(seq: np.ndarray) -> np.ndarray:
+    diffs = np.diff(seq, axis=0)
+    return 0.5 * np.linalg.norm(diffs, axis=1)
+
+
+def classical_features_from_sequence(seq: np.ndarray) -> np.ndarray:
+    seq = np.asarray(seq, dtype=float)
+
+    mean_f = seq.mean(axis=0)
+    std_f = seq.std(axis=0)
+    min_f = seq.min(axis=0)
+    max_f = seq.max(axis=0)
+    median_f = np.median(seq, axis=0)
+
+    delta_f = seq[-1] - seq[0]
+    range_f = max_f - min_f
+
+    vel = np.linalg.norm(np.diff(seq, axis=0), axis=1)
+    vel_stats = np.array([
+        vel.mean(),
+        vel.std(),
+        vel.min(),
+        vel.max(),
+    ])
+
+    flat = seq.flatten()
+
+    return np.concatenate([
+        flat,
+        mean_f,
+        std_f,
+        min_f,
+        max_f,
+        median_f,
+        delta_f,
+        range_f,
+        vel_stats,
+    ])
+
+
+def quantum_native_features_from_sequence(seq: np.ndarray) -> np.ndarray:
+    rho = density_matrix_from_sequence(seq)
+    eigvals = np.linalg.eigvalsh(rho)
+    eigvals = np.sort(eigvals)[::-1]
+
+    ent = von_neumann_entropy(rho)
+    pur = purity(rho)
+    offdiag = np.sum(np.abs(rho - np.diag(np.diag(rho))))
+
+    tm = transport_metrics_from_sequence(seq)
+    tm_stats = np.array([
+        tm.mean(),
+        tm.std(),
+        tm.min(),
+        tm.max(),
+    ])
+
+    rho_flat = rho.flatten().real
+
+    return np.concatenate([
+        eigvals,
+        np.array([ent, pur, offdiag]),
+        tm_stats,
+        rho_flat,
+    ])
+
+
+def build_feature_sets(X_seq: np.ndarray):
+    classical = []
+    quantum_native = []
+
+    for seq in X_seq:
+        classical.append(classical_features_from_sequence(seq))
+        quantum_native.append(quantum_native_features_from_sequence(seq))
+
+    return np.array(classical), np.array(quantum_native)
+
+
+# ============================================================
+# DATA HELPERS
+# ============================================================
+def optional_downsample(X1, X2, y, max_total=None, random_state=42):
+    if max_total is None or len(y) <= max_total:
+        return X1, X2, y
+
+    rng = np.random.default_rng(random_state)
+    idx = rng.choice(np.arange(len(y)), size=max_total, replace=False)
+    return X1[idx], X2[idx], y[idx]
+
+
+def oversample_minority(X, y, random_state=42):
+    """
+    Random oversampling on training data only.
+    """
+    rng = np.random.default_rng(random_state)
+
+    classes, counts = np.unique(y, return_counts=True)
+    if len(classes) != 2:
+        return X, y
+
+    max_count = counts.max()
+
+    X_balanced = []
+    y_balanced = []
+
+    for c in classes:
+        idx = np.where(y == c)[0]
+        needed = max_count - len(idx)
+
+        X_balanced.append(X[idx])
+        y_balanced.append(y[idx])
+
+        if needed > 0:
+            extra_idx = rng.choice(idx, size=needed, replace=True)
+            X_balanced.append(X[extra_idx])
+            y_balanced.append(y[extra_idx])
+
+    X_out = np.vstack(X_balanced)
+    y_out = np.concatenate(y_balanced)
+
+    perm = rng.permutation(len(y_out))
+    return X_out[perm], y_out[perm]
+
+
+# ============================================================
+# METRICS
+# ============================================================
+def get_scores(model, X):
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    if hasattr(model, "decision_function"):
+        return model.decision_function(X)
+    return None
+
+
+def compute_metrics(y_true, y_pred, y_score=None):
+    out = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+    if y_score is not None:
+        try:
+            out["roc_auc"] = roc_auc_score(y_true, y_score)
+        except Exception:
+            out["roc_auc"] = np.nan
+    else:
+        out["roc_auc"] = np.nan
+
+    return out
+
+
+def mean_cv_metric(result, key):
+    vals = [fold[key] for fold in result["cv_scores"]]
+    return float(np.nanmean(vals))
+
+
+# ============================================================
+# MODEL EVALUATION
+# ============================================================
+def evaluate_sklearn_model(name, model, X_train, X_test, y_train, y_test, n_splits=5):
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = []
+
+    for fold_id, (tr_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
+        Xtr, Xval = X_train[tr_idx], X_train[val_idx]
+        ytr, yval = y_train[tr_idx], y_train[val_idx]
+
+        if BALANCE_TRAINING:
+            Xtr, ytr = oversample_minority(Xtr, ytr, random_state=RANDOM_STATE + fold_id)
+
+        model.fit(Xtr, ytr)
+        pred = model.predict(Xval)
+        score = get_scores(model, Xval)
+
+        cv_scores.append(compute_metrics(yval, pred, score))
+
+    Xfit, yfit = X_train, y_train
+    if BALANCE_TRAINING:
+        Xfit, yfit = oversample_minority(Xfit, yfit, random_state=RANDOM_STATE)
+
+    model.fit(Xfit, yfit)
+    test_pred = model.predict(X_test)
+    test_score = get_scores(model, X_test)
+    test_metrics = compute_metrics(y_test, test_pred, test_score)
+
+    return {
+        "name": name,
+        "cv_scores": cv_scores,
+        "test_metrics": test_metrics,
+        "y_pred": test_pred,
+        "y_score": test_score,
+    }
+
+
+def evaluate_qsvc(name, X_train_raw, X_test_raw, y_train, y_test, n_splits=5):
+    def make_qsvc():
+        feature_map = ZZFeatureMap(feature_dimension=QUBIT_DIM, reps=ZZ_REPS)
+        qkernel = FidelityQuantumKernel(feature_map=feature_map)
+        return QSVC(quantum_kernel=qkernel)
+
+    def transform_train_test(Xtr, Xte):
+        scaler = StandardScaler()
+        Xtr_s = scaler.fit_transform(Xtr)
+        Xte_s = scaler.transform(Xte)
+
+        n_comp = min(QUBIT_DIM, Xtr_s.shape[1])
+        pca = PCA(n_components=n_comp, random_state=RANDOM_STATE)
+        Xtr_p = pca.fit_transform(Xtr_s)
+        Xte_p = pca.transform(Xte_s)
+
+        angle_scaler = MinMaxScaler(feature_range=(0, np.pi))
+        Xtr_q = angle_scaler.fit_transform(Xtr_p)
+        Xte_q = angle_scaler.transform(Xte_p)
+
+        return Xtr_q, Xte_q
+
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = []
+
+    for fold_id, (tr_idx, val_idx) in enumerate(cv.split(X_train_raw, y_train)):
+        Xtr_raw, Xval_raw = X_train_raw[tr_idx], X_train_raw[val_idx]
+        ytr, yval = y_train[tr_idx], y_train[val_idx]
+
+        if BALANCE_TRAINING:
+            Xtr_raw, ytr = oversample_minority(Xtr_raw, ytr, random_state=RANDOM_STATE + fold_id)
+
+        Xtr, Xval = transform_train_test(Xtr_raw, Xval_raw)
+
+        model = make_qsvc()
+        model.fit(Xtr, ytr)
+
+        pred = model.predict(Xval)
+        score = get_scores(model, Xval)
+        cv_scores.append(compute_metrics(yval, pred, score))
+
+    Xfit_raw, yfit = X_train_raw, y_train
+    if BALANCE_TRAINING:
+        Xfit_raw, yfit = oversample_minority(Xfit_raw, yfit, random_state=RANDOM_STATE)
+
+    Xfit, Xtest = transform_train_test(Xfit_raw, X_test_raw)
+
+    model = make_qsvc()
+    model.fit(Xfit, yfit)
+
+    test_pred = model.predict(Xtest)
+    test_score = get_scores(model, Xtest)
+    test_metrics = compute_metrics(y_test, test_pred, test_score)
+
+    return {
+        "name": name,
+        "cv_scores": cv_scores,
+        "test_metrics": test_metrics,
+        "y_pred": test_pred,
+        "y_score": test_score,
+    }
+
+
+# ============================================================
+# PLOTTING
+# ============================================================
+def plot_metric_bars(results, save_path):
+    names = [r["name"] for r in results]
+    bal_acc = [r["test_metrics"]["balanced_accuracy"] for r in results]
+    f1s = [r["test_metrics"]["f1"] for r in results]
+    aucs = [r["test_metrics"]["roc_auc"] for r in results]
+
+    x = np.arange(len(names))
+    w = 0.25
+
+    plt.figure(figsize=(13, 6))
+    plt.bar(x - w, bal_acc, width=w, label="Balanced Accuracy")
+    plt.bar(x, f1s, width=w, label="F1")
+    plt.bar(x + w, aucs, width=w, label="ROC-AUC")
+
+    plt.xticks(x, names, rotation=20, ha="right")
+    plt.ylim(0, 1.05)
+    plt.ylabel("Score")
+    plt.title("Fair Classical vs Quantum Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_cv_f1(results, save_path):
+    plt.figure(figsize=(11, 5))
+    data = [[fold["f1"] for fold in r["cv_scores"]] for r in results]
+    labels = [r["name"] for r in results]
+
+    plt.boxplot(data, tick_labels=labels, showmeans=True)
+    plt.ylabel("F1")
+    plt.title("Cross-Validation F1 Distribution")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_roc_curves(results, y_test, save_path):
+    plt.figure(figsize=(8, 6))
+
+    drawn = 0
+    for r in results:
+        if r["y_score"] is None:
+            continue
+        try:
+            fpr, tpr, _ = roc_curve(y_test, r["y_score"])
+            auc = r["test_metrics"]["roc_auc"]
+            plt.plot(fpr, tpr, label=f"{r['name']} (AUC={auc:.3f})")
+            drawn += 1
+        except Exception:
+            pass
+
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves")
+    if drawn > 0:
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_confusion_matrices(results, y_test, save_path):
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes = axes.flatten()
+
+    for ax, r in zip(axes, results):
+        cm = confusion_matrix(y_test, r["y_pred"])
+        ax.imshow(cm, cmap="Blues")
+        ax.set_title(r["name"])
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+
+    for ax in axes[len(results):]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_feature_space(raw_X, qnative_X, y, save_path):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for ax, X, title in zip(
+        axes,
+        [raw_X, qnative_X],
+        ["Raw/Classical Features (PCA)", "Quantum-Native Features (PCA)"],
+    ):
+        Xs = StandardScaler().fit_transform(X)
+        X2 = PCA(n_components=2, random_state=RANDOM_STATE).fit_transform(Xs)
+
+        ax.scatter(X2[y == 0, 0], X2[y == 0, 1], s=12, alpha=0.6, label="Interictal")
+        ax.scatter(X2[y == 1, 0], X2[y == 1, 1], s=12, alpha=0.6, label="Ictal")
+        ax.set_title(title)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def save_results_json(results, path):
+    payload = {}
+    for r in results:
+        payload[r["name"]] = {
+            "cv_mean_accuracy": mean_cv_metric(r, "accuracy"),
+            "cv_mean_balanced_accuracy": mean_cv_metric(r, "balanced_accuracy"),
+            "cv_mean_f1": mean_cv_metric(r, "f1"),
+            "cv_mean_roc_auc": mean_cv_metric(r, "roc_auc"),
+            "test_metrics": {
+                k: (None if np.isnan(v) else float(v))
+                for k, v in r["test_metrics"].items()
+            },
+        }
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+if not os.path.exists(X_PATH):
+    raise FileNotFoundError(f"Missing file: {X_PATH}")
+if not os.path.exists(Y_PATH):
+    raise FileNotFoundError(f"Missing file: {Y_PATH}")
+
+X_seq = np.load(X_PATH)
+y = np.load(Y_PATH).astype(int)
+
+print("✅ Loaded dataset")
+print("X_seq shape:", X_seq.shape)
+print("y shape    :", y.shape)
+
+# ============================================================
+# BUILD FEATURE SETS
+# ============================================================
+X_raw, X_qnative = build_feature_sets(X_seq)
+
+print("✅ Built feature sets")
+print("Raw/classical feature shape :", X_raw.shape)
+print("Quantum-native feature shape:", X_qnative.shape)
+
+X_raw, X_qnative, y = optional_downsample(
+    X_raw, X_qnative, y,
+    max_total=MAX_TOTAL_SAMPLES,
+    random_state=RANDOM_STATE
+)
+
+print("✅ Final dataset")
+print("Raw shape     :", X_raw.shape)
+print("Q-native shape:", X_qnative.shape)
+print("Class counts  :", np.sum(y == 0), "/", np.sum(y == 1))
+
+# ============================================================
+# SPLIT
+# ============================================================
+(
+    Xraw_train,
+    Xraw_test,
+    Xq_train,
+    Xq_test,
+    y_train,
+    y_test,
+) = train_test_split(
+    X_raw,
+    X_qnative,
+    y,
+    test_size=TEST_SIZE,
+    stratify=y,
+    random_state=RANDOM_STATE,
+)
+
+print("✅ Train/test split")
+print("Train:", len(y_train))
+print("Test :", len(y_test))
+print("Train class counts:", np.sum(y_train == 0), "/", np.sum(y_train == 1))
+print("Test class counts :", np.sum(y_test == 0), "/", np.sum(y_test == 1))
+
+# ============================================================
+# MODELS
+# ============================================================
+results = []
+
+# Classical on raw
+results.append(
+    evaluate_sklearn_model(
+        "Classical-Raw-SVM",
+        Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        Xraw_train, Xraw_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+# Classical on quantum-native
+results.append(
+    evaluate_sklearn_model(
+        "Classical-QNative-SVM",
+        Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        Xq_train, Xq_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+# Quantum on raw
+results.append(
+    evaluate_qsvc(
+        "Quantum-Raw-QSVC",
+        Xraw_train, Xraw_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+# Quantum on quantum-native
+results.append(
+    evaluate_qsvc(
+        "Quantum-QNative-QSVC",
+        Xq_train, Xq_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+# Optional classical baselines
+results.append(
+    evaluate_sklearn_model(
+        "Classical-Raw-LogReg",
+        Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=4000, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        Xraw_train, Xraw_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+results.append(
+    evaluate_sklearn_model(
+        "Classical-Raw-RandomForest",
+        RandomForestClassifier(
+            n_estimators=300,
+            class_weight="balanced_subsample",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        Xraw_train, Xraw_test, y_train, y_test, n_splits=N_SPLITS
+    )
+)
+
+# ============================================================
+# PRINT RESULTS
+# ============================================================
+print("\n================ FAIR FINAL RESULTS ================\n")
+for r in results:
+    tm = r["test_metrics"]
+    print(r["name"])
+    print(f"  CV Mean Accuracy          : {mean_cv_metric(r, 'accuracy'):.4f}")
+    print(f"  CV Mean Balanced Accuracy : {mean_cv_metric(r, 'balanced_accuracy'):.4f}")
+    print(f"  CV Mean F1                : {mean_cv_metric(r, 'f1'):.4f}")
+    print(f"  CV Mean ROC-AUC           : {mean_cv_metric(r, 'roc_auc'):.4f}")
+    print(f"  Test Accuracy             : {tm['accuracy']:.4f}")
+    print(f"  Test Balanced Accuracy    : {tm['balanced_accuracy']:.4f}")
+    print(f"  Test Precision            : {tm['precision']:.4f}")
+    print(f"  Test Recall               : {tm['recall']:.4f}")
+    print(f"  Test F1                   : {tm['f1']:.4f}")
+    print(f"  Test ROC-AUC              : {tm['roc_auc']:.4f}")
+    print()
+
+# ============================================================
+# SAVE OUTPUTS
+# ============================================================
+save_results_json(results, os.path.join(COMPARE_DIR, "comparison_results.json"))
+
+with open(os.path.join(COMPARE_DIR, "comparison_summary.txt"), "w") as f:
+    f.write("Fair Classical vs Quantum Comparison\n")
+    f.write("====================================\n\n")
+    for r in results:
+        tm = r["test_metrics"]
+        f.write(f"{r['name']}\n")
+        f.write(f"  CV Mean Accuracy          : {mean_cv_metric(r, 'accuracy'):.4f}\n")
+        f.write(f"  CV Mean Balanced Accuracy : {mean_cv_metric(r, 'balanced_accuracy'):.4f}\n")
+        f.write(f"  CV Mean F1                : {mean_cv_metric(r, 'f1'):.4f}\n")
+        f.write(f"  CV Mean ROC-AUC           : {mean_cv_metric(r, 'roc_auc'):.4f}\n")
+        f.write(f"  Test Accuracy             : {tm['accuracy']:.4f}\n")
+        f.write(f"  Test Balanced Accuracy    : {tm['balanced_accuracy']:.4f}\n")
+        f.write(f"  Test Precision            : {tm['precision']:.4f}\n")
+        f.write(f"  Test Recall               : {tm['recall']:.4f}\n")
+        f.write(f"  Test F1                   : {tm['f1']:.4f}\n")
+        f.write(f"  Test ROC-AUC              : {tm['roc_auc']:.4f}\n\n")
+
+plot_metric_bars(results, os.path.join(COMPARE_DIR, "metric_bars_balanced.png"))
+plot_cv_f1(results, os.path.join(COMPARE_DIR, "cv_f1_boxplot.png"))
+plot_roc_curves(results, y_test, os.path.join(COMPARE_DIR, "roc_curves.png"))
+plot_confusion_matrices(results, y_test, os.path.join(COMPARE_DIR, "confusion_matrices.png"))
+plot_feature_space(X_raw, X_qnative, y, os.path.join(COMPARE_DIR, "feature_space_pca.png"))
+
+print("✅ Saved outputs to:", COMPARE_DIR)
+print(" - comparison_results.json")
+print(" - comparison_summary.txt")
+print(" - metric_bars_balanced.png")
+print(" - cv_f1_boxplot.png")
+print(" - roc_curves.png")
+print(" - confusion_matrices.png")
+print(" - feature_space_pca.png")
+print("\n✅ Fair classical vs quantum comparison complete")

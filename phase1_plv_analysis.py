@@ -92,10 +92,6 @@ def run_phase1():
 
     gamma_interictal = extract_window(gamma, INTERICTAL_START, INTERICTAL_END, sfreq)
     gamma_ictal = extract_window(gamma, ICTAL_START, ICTAL_END, sfreq)
-
-    # -----------------------------
-    # COMPUTE METRICS
-    # -----------------------------
     plv_interictal = compute_plv_distribution(theta_interictal)
     plv_ictal = compute_plv_distribution(theta_ictal)
 
@@ -104,17 +100,9 @@ def run_phase1():
 
     cfc_interictal = compute_cfc(theta_interictal, gamma_interictal)
     cfc_ictal = compute_cfc(theta_ictal, gamma_ictal)
-
-    # -----------------------------
-    # PRINT SUMMARY
-    # -----------------------------
     print(f"Mean PLV: Interictal={np.mean(plv_interictal):.3f}, Ictal={np.mean(plv_ictal):.3f}")
     print(f"Mean PLI: Interictal={np.mean(pli_interictal):.3f}, Ictal={np.mean(pli_ictal):.3f}")
     print(f"Mean CFC: Interictal={np.mean(cfc_interictal):.3f}, Ictal={np.mean(cfc_ictal):.3f}")
-
-    # -----------------------------
-    # VISUALIZE
-    # -----------------------------
     plt.figure(figsize=(10, 6))
     plt.hist(plv_interictal, bins=50, alpha=0.5, label="PLV Interictal")
     plt.hist(plv_ictal, bins=50, alpha=0.5, label="PLV Ictal")
